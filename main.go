@@ -1,53 +1,152 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
 
+var (
+	forceMonorepo bool
+	intervalMins  string
+)
+
+func init() {
+	flag.BoolVar(&forceMonorepo, "mr", false, "Force monorepo mode (auto-detects if not set)")
+	flag.BoolVar(&forceMonorepo, "monorepo", false, "Force monorepo mode (auto-detects if not set)")
+	flag.StringVar(&intervalMins, "i", "0.5", "Check interval in minutes (0.5-30)")
+	flag.StringVar(&intervalMins, "interval", "0.5", "Check interval in minutes (0.5-30)")
+
+	flag.Usage = showHelp
+}
+
+func showHelp() {
+	fmt.Println("🚀 Git Air - Automatic Git synchronization service")
+	fmt.Println("\nUSAGE:")
+	fmt.Println("  git-air [options]")
+	fmt.Println("\nOPTIONS:")
+	fmt.Println("  -h, --help              Show this help screen")
+	fmt.Println("  -i, --interval <mins>   Check interval in minutes (0.5-30)")
+	fmt.Println("                          Examples: 0.5, 1, 2, 5, 10, 30")
+	fmt.Println("                          Default: 0.5 (30 seconds)")
+	fmt.Println("  -mr, --monorepo         Force monorepo mode")
+	fmt.Println("                          (auto-detects if not set)")
+	fmt.Println("\nEXAMPLES:")
+	fmt.Println("  git-air                 # Run with default 30 second interval")
+	fmt.Println("  git-air -i 1            # Check every 1 minute")
+	fmt.Println("  git-air -i 5 -mr        # Check every 5 minutes, force monorepo")
+	fmt.Println("  git-air --interval 10   # Check every 10 minutes")
+	fmt.Println("\nDESCRIPTION:")
+	fmt.Println("  Automatically discovers and synchronizes all Git repositories")
+	fmt.Println("  in the current directory and subdirectories.")
+	fmt.Println("\n  Features:")
+	fmt.Println("  • Auto-commits changes with timestamp")
+	fmt.Println("  • Pushes to ALL configured remotes")
+	fmt.Println("  • Pulls updates for inter-project communication")
+	fmt.Println("  • Handles monorepos with submodules")
+	fmt.Println()
+}
+
+func parseInterval(intervalStr string) (time.Duration, error) {
+	mins, err := strconv.ParseFloat(intervalStr, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid interval format: %v", err)
+	}
+
+	if mins < 0.5 || mins > 30 {
+		return 0, fmt.Errorf("interval must be between 0.5 and 30 minutes, got: %.1f", mins)
+	}
+
+	return time.Duration(mins * float64(time.Minute)), nil
+}
+
 func main() {
+	flag.Parse()
+
+	// Parse and validate interval
+	checkInterval, err := parseInterval(intervalMins)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "❌ Error: %v\n\n", err)
+		showHelp()
+		os.Exit(1)
+	}
+
 	fmt.Println("🚀 Git Air - Auto sync all Git repos")
 	fmt.Println("📡 Inter-project communication via Git synchronization")
 	fmt.Println("📚 Supports monorepos and multi-repos")
-	
+	fmt.Printf("⏱️  Check interval: %.1f minutes\n", checkInterval.Minutes())
+	if forceMonorepo {
+		fmt.Println("🔧 Monorepo mode: FORCED")
+	} else {
+		fmt.Println("🔧 Monorepo mode: AUTO-DETECT")
+	}
+	fmt.Println()
+
 	// Find all git repos in current directory and subdirs
 	repos, err := findGitRepos(".")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("❌ Error finding repositories: %v\n", err)
 	}
-	
+
+	if len(repos) == 0 {
+		fmt.Println("⚠️  No Git repositories found in current directory")
+		fmt.Println("💡 Make sure you're in a directory containing Git repositories")
+		os.Exit(0)
+	}
+
 	fmt.Printf("Found %d Git repositories\n", len(repos))
 	for _, repo := range repos {
 		repoType := "repo"
-		if isMonorepo(repo) {
+		if forceMonorepo || isMonorepo(repo) {
 			repoType = "MONOREPO"
 		}
 		fmt.Printf("  📁 %s [%s]\n", repo, repoType)
 	}
-	
-	// Main loop - check every 30 seconds for changes, pull every minute
+	fmt.Println()
+
+	// Calculate pull interval (every minute or every checkInterval, whichever is longer)
+	pullInterval := time.Minute
+	if checkInterval > pullInterval {
+		pullInterval = checkInterval
+	}
+
+	// Main loop
 	lastPull := time.Now()
+	iteration := 0
+
 	for {
+		iteration++
+		fmt.Printf("🔄 Check cycle #%d\n", iteration)
+
 		// Auto commit and push changes
+		changesFound := false
 		for _, repo := range repos {
-			processRepo(repo)
+			if processRepo(repo, forceMonorepo) {
+				changesFound = true
+			}
 		}
-		
-		// Pull from all repos every minute for inter-project communication
-		if time.Since(lastPull) >= time.Minute {
+
+		if !changesFound {
+			fmt.Println("  ✓ No changes detected")
+		}
+
+		// Pull from all repos at pull interval
+		if time.Since(lastPull) >= pullInterval {
 			fmt.Println("\n📡 Checking for inter-project updates...")
 			for _, repo := range repos {
 				pullUpdates(repo)
 			}
 			lastPull = time.Now()
 		}
-		
-		time.Sleep(30 * time.Second)
+
+		fmt.Printf("\n💤 Sleeping for %.1f minutes...\n\n", checkInterval.Minutes())
+		time.Sleep(checkInterval)
 	}
 }
 
@@ -78,53 +177,84 @@ func findGitRepos(root string) ([]string, error) {
 	return repos, err
 }
 
-// processRepo handles one git repository
-func processRepo(repoPath string) {
+// processRepo handles one git repository, returns true if changes were committed
+func processRepo(repoPath string, forceMonorepo bool) bool {
 	// Change to repo directory
-	oldDir, _ := os.Getwd()
-	os.Chdir(repoPath)
+	oldDir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("  ❌ Error getting working directory: %v\n", err)
+		return false
+	}
+
+	if err := os.Chdir(repoPath); err != nil {
+		fmt.Printf("  ❌ Error changing to %s: %v\n", repoPath, err)
+		return false
+	}
 	defer os.Chdir(oldDir)
-	
+
+	// Determine if this is a monorepo
+	isMonorepoMode := forceMonorepo || isMonorepo(repoPath)
+
 	// For monorepos: sync submodules FIRST
-	if isMonorepo(repoPath) {
+	if isMonorepoMode {
 		if !syncSubmodules(repoPath) {
 			fmt.Printf("  ❌ Skipping %s - submodule sync failed\n", filepath.Base(repoPath))
-			return
+			return false
 		}
 	}
-	
+
 	// Check if there are changes AFTER submodule sync
 	if !hasChanges() {
-		return // No changes to commit
+		return false // No changes to commit
 	}
-	
+
 	repoName := filepath.Base(repoPath)
 	repoType := ""
-	if isMonorepo(repoPath) {
+	if isMonorepoMode {
 		repoType = " [MONOREPO]"
 	}
 	fmt.Printf("📝 %s%s: Auto committing changes...\n", repoName, repoType)
-	
+
 	// Auto commit with monorepo-aware message
-	runGit("add", ".")
+	if !runGit("add", ".") {
+		fmt.Printf("  ❌ Error staging changes in %s\n", repoName)
+		return false
+	}
+
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	commitMsg := "auto commit - " + timestamp
-	if isMonorepo(repoPath) {
+	if isMonorepoMode {
 		commitMsg = "auto commit (monorepo) - " + timestamp
 	}
-	runGit("commit", "-m", commitMsg)
-	
+
+	if !runGit("commit", "-m", commitMsg) {
+		fmt.Printf("  ⚠️  Commit failed in %s (may be empty or have errors)\n", repoName)
+		return false
+	}
+
+	fmt.Printf("  ✓ Committed changes in %s\n", repoName)
+
 	// Push to all remotes immediately
 	pushToAllRemotes()
+
+	return true
 }
 
 // pullUpdates pulls from remotes for inter-project communication
 func pullUpdates(repoPath string) {
 	// Change to repo directory
-	oldDir, _ := os.Getwd()
-	os.Chdir(repoPath)
+	oldDir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("  ❌ Error getting working directory: %v\n", err)
+		return
+	}
+
+	if err := os.Chdir(repoPath); err != nil {
+		fmt.Printf("  ❌ Error changing to %s: %v\n", repoPath, err)
+		return
+	}
 	defer os.Chdir(oldDir)
-	
+
 	pullFromRemotes()
 }
 
@@ -142,13 +272,24 @@ func hasChanges() bool {
 func pushToAllRemotes() {
 	remotes := getRemotes()
 	if len(remotes) == 0 {
+		fmt.Println("  ⚠️  No remotes configured, skipping push")
 		return
 	}
-	
+
 	branch := getCurrentBranch()
+	successCount := 0
 	for _, remote := range remotes {
-		fmt.Printf("  🚀 Push to %s\n", remote)
-		runGit("push", remote, branch)
+		fmt.Printf("  🚀 Pushing to %s...", remote)
+		if runGit("push", remote, branch) {
+			fmt.Printf(" ✓\n")
+			successCount++
+		} else {
+			fmt.Printf(" ❌ failed\n")
+		}
+	}
+
+	if successCount > 0 {
+		fmt.Printf("  ✓ Successfully pushed to %d/%d remotes\n", successCount, len(remotes))
 	}
 }
 
@@ -158,19 +299,28 @@ func pullFromRemotes() {
 	if len(remotes) == 0 {
 		return
 	}
-	
+
 	branch := getCurrentBranch()
 	repoName := filepath.Base(getCurrentDir())
-	
+
 	// Try to pull from each remote
 	for _, remote := range remotes {
-		fmt.Printf("  📥 %s: Checking %s for updates\n", repoName, remote)
-		runGit("fetch", remote)
-		
+		fmt.Printf("  📥 %s: Checking %s for updates...", repoName, remote)
+		if !runGit("fetch", remote) {
+			fmt.Printf(" ❌ fetch failed\n")
+			continue
+		}
+
 		// Check if there are remote changes
 		if hasRemoteChanges(remote, branch) {
-			fmt.Printf("  📡 %s: Pulling inter-project updates from %s\n", repoName, remote)
-			runGit("pull", remote, branch)
+			fmt.Printf("\n  📡 %s: Pulling updates from %s...", repoName, remote)
+			if runGit("pull", remote, branch) {
+				fmt.Printf(" ✓\n")
+			} else {
+				fmt.Printf(" ❌ pull failed\n")
+			}
+		} else {
+			fmt.Printf(" ✓ up to date\n")
 		}
 	}
 }
@@ -259,27 +409,38 @@ func isMonorepo(repoPath string) bool {
 // syncSubmodules ensures all submodules are updated before main repo commit
 func syncSubmodules(repoPath string) bool {
 	// Change to repo directory
-	oldDir, _ := os.Getwd()
-	os.Chdir(repoPath)
+	oldDir, err := os.Getwd()
+	if err != nil {
+		fmt.Printf("  ❌ Error getting working directory: %v\n", err)
+		return false
+	}
+
+	if err := os.Chdir(repoPath); err != nil {
+		fmt.Printf("  ❌ Error changing to %s: %v\n", repoPath, err)
+		return false
+	}
 	defer os.Chdir(oldDir)
-	
+
 	// Check if there are submodules
 	gitmodules := filepath.Join(repoPath, ".gitmodules")
 	if _, err := os.Stat(gitmodules); err != nil {
 		return true // No submodules, all good
 	}
-	
-	fmt.Printf("  📦 Syncing submodules in monorepo...\n")
-	
+
+	fmt.Printf("  📦 Syncing submodules...")
+
 	// Update all submodules
 	if !runGit("submodule", "update", "--remote", "--merge") {
-		fmt.Printf("  ⚠️  Submodule update failed\n")
+		fmt.Printf(" ❌ failed\n")
 		return false
 	}
-	
+
 	// Add any submodule changes
-	runGit("add", ".")
-	
-	fmt.Printf("  ✅ Submodules synced\n")
+	if !runGit("add", ".") {
+		fmt.Printf(" ⚠️  failed to stage submodule changes\n")
+		return false
+	}
+
+	fmt.Printf(" ✓\n")
 	return true
 }
