@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -15,6 +17,7 @@ import (
 var (
 	forceMonorepo bool
 	intervalMins  string
+	useAICommits  bool
 )
 
 func init() {
@@ -22,6 +25,8 @@ func init() {
 	flag.BoolVar(&forceMonorepo, "monorepo", false, "Force monorepo mode (auto-detects if not set)")
 	flag.StringVar(&intervalMins, "i", "0.5", "Check interval in minutes (0.5-30)")
 	flag.StringVar(&intervalMins, "interval", "0.5", "Check interval in minutes (0.5-30)")
+	flag.BoolVar(&useAICommits, "ai", false, "Use AI-generated commit messages via gemini CLI")
+	flag.BoolVar(&useAICommits, "ai-commits", false, "Use AI-generated commit messages via gemini CLI")
 
 	flag.Usage = showHelp
 }
@@ -37,16 +42,21 @@ func showHelp() {
 	fmt.Println("                          Default: 0.5 (30 seconds)")
 	fmt.Println("  -mr, --monorepo         Force monorepo mode")
 	fmt.Println("                          (auto-detects if not set)")
+	fmt.Println("  -ai, --ai-commits       Use AI-generated commit messages")
+	fmt.Println("                          (requires gemini CLI installed)")
+	fmt.Println("                          Falls back to timestamp on error")
 	fmt.Println("\nEXAMPLES:")
 	fmt.Println("  git-air                 # Run with default 30 second interval")
 	fmt.Println("  git-air -i 1            # Check every 1 minute")
 	fmt.Println("  git-air -i 5 -mr        # Check every 5 minutes, force monorepo")
 	fmt.Println("  git-air --interval 10   # Check every 10 minutes")
+	fmt.Println("  git-air -ai             # Use AI-generated commit messages")
+	fmt.Println("  git-air -i 2 -ai        # 2 min interval with AI commits")
 	fmt.Println("\nDESCRIPTION:")
 	fmt.Println("  Automatically discovers and synchronizes all Git repositories")
 	fmt.Println("  in the current directory and subdirectories.")
 	fmt.Println("\n  Features:")
-	fmt.Println("  • Auto-commits changes with timestamp")
+	fmt.Println("  • Auto-commits changes with timestamp or AI-generated messages")
 	fmt.Println("  • Pushes to ALL configured remotes")
 	fmt.Println("  • Pulls updates for inter-project communication")
 	fmt.Println("  • Handles monorepos with submodules")
@@ -85,6 +95,11 @@ func main() {
 		fmt.Println("🔧 Monorepo mode: FORCED")
 	} else {
 		fmt.Println("🔧 Monorepo mode: AUTO-DETECT")
+	}
+	if useAICommits {
+		fmt.Println("🤖 AI Commits: ENABLED (via gemini CLI)")
+	} else {
+		fmt.Println("🤖 AI Commits: DISABLED (using timestamp)")
 	}
 	fmt.Println()
 
@@ -127,7 +142,7 @@ func main() {
 		// Auto commit and push changes
 		changesFound := false
 		for _, repo := range repos {
-			if processRepo(repo, forceMonorepo) {
+			if processRepo(repo, forceMonorepo, useAICommits) {
 				changesFound = true
 			}
 		}
@@ -177,8 +192,56 @@ func findGitRepos(root string) ([]string, error) {
 	return repos, err
 }
 
+// generateAICommitMessage calls gemini CLI to generate commit message
+func generateAICommitMessage(gitDiff string) (string, error) {
+	// Create context with timeout (20 seconds for gemini to respond)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	prompt := "Generate a concise git commit message (one line, max 50 chars, imperative mood):"
+	input := fmt.Sprintf("Git changes:\n%s", gitDiff)
+
+	cmd := exec.CommandContext(ctx, "gemini", "-p", prompt)
+	cmd.Stdin = strings.NewReader(input)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		// Context timeout or gemini error
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("gemini timeout after 20s")
+		}
+		return "", fmt.Errorf("gemini error: %v", err)
+	}
+
+	output := stdout.String()
+
+	// Parse output - gemini returns result followed by "Loaded cached credentials."
+	// We want the first non-empty line that's not the credentials message
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.Contains(line, "Loaded cached credentials") && !strings.Contains(line, "credentials") {
+			// Clean up the message
+			line = strings.TrimPrefix(line, "feat: ")
+			line = strings.TrimPrefix(line, "fix: ")
+			line = strings.TrimPrefix(line, "chore: ")
+			// Keep it simple
+			if len(line) > 72 {
+				line = line[:72]
+			}
+			return line, nil
+		}
+	}
+
+	return "", fmt.Errorf("no valid response from gemini")
+}
+
 // processRepo handles one git repository, returns true if changes were committed
-func processRepo(repoPath string, forceMonorepo bool) bool {
+func processRepo(repoPath string, forceMonorepo bool, useAI bool) bool {
 	// Change to repo directory
 	oldDir, err := os.Getwd()
 	if err != nil {
@@ -222,9 +285,45 @@ func processRepo(repoPath string, forceMonorepo bool) bool {
 	}
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	commitMsg := "auto commit - " + timestamp
-	if isMonorepoMode {
-		commitMsg = "auto commit (monorepo) - " + timestamp
+	var commitMsg string
+
+	// Try AI-generated commit message if enabled
+	if useAI {
+		fmt.Printf("  🤖 Generating AI commit message...")
+
+		// Get git diff to send to AI
+		diffCmd := exec.Command("git", "diff", "--staged")
+		diffOutput, diffErr := diffCmd.Output()
+
+		if diffErr == nil && len(diffOutput) > 0 {
+			aiMsg, aiErr := generateAICommitMessage(string(diffOutput))
+			if aiErr == nil && aiMsg != "" {
+				commitMsg = aiMsg
+				fmt.Printf(" ✓\n")
+				fmt.Printf("  💬 AI message: \"%s\"\n", commitMsg)
+			} else {
+				// Fallback to timestamp
+				fmt.Printf(" ❌ (%v)\n", aiErr)
+				fmt.Printf("  ⚠️  Falling back to timestamp commit\n")
+				commitMsg = "auto commit - " + timestamp
+				if isMonorepoMode {
+					commitMsg = "auto commit (monorepo) - " + timestamp
+				}
+			}
+		} else {
+			// No diff or error getting diff, use timestamp
+			fmt.Printf(" ⚠️  no diff available\n")
+			commitMsg = "auto commit - " + timestamp
+			if isMonorepoMode {
+				commitMsg = "auto commit (monorepo) - " + timestamp
+			}
+		}
+	} else {
+		// Use timestamp-based commit message
+		commitMsg = "auto commit - " + timestamp
+		if isMonorepoMode {
+			commitMsg = "auto commit (monorepo) - " + timestamp
+		}
 	}
 
 	if !runGit("commit", "-m", commitMsg) {
@@ -232,7 +331,11 @@ func processRepo(repoPath string, forceMonorepo bool) bool {
 		return false
 	}
 
-	fmt.Printf("  ✓ Committed changes in %s\n", repoName)
+	if !useAI {
+		fmt.Printf("  ✓ Committed changes in %s\n", repoName)
+	} else {
+		fmt.Printf("  ✓ Committed with AI message\n")
+	}
 
 	// Push to all remotes immediately
 	pushToAllRemotes()
