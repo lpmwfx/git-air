@@ -15,10 +15,11 @@ import (
 )
 
 var (
-	forceMonorepo   bool
-	intervalMins    string
-	useAICommits    bool
+	forceMonorepo    bool
+	intervalMins     string
+	useAICommits     bool
 	useClaudeCommits bool
+	useQwenCommits   bool
 )
 
 func init() {
@@ -30,6 +31,8 @@ func init() {
 	flag.BoolVar(&useAICommits, "ai-commits", false, "Use AI-generated commit messages via gemini CLI")
 	flag.BoolVar(&useClaudeCommits, "claude", false, "Use Claude AI for commit messages (via claude CLI)")
 	flag.BoolVar(&useClaudeCommits, "claude-commits", false, "Use Claude AI for commit messages (via claude CLI)")
+	flag.BoolVar(&useQwenCommits, "qwen", false, "Use Qwen AI for commit messages (via qwen CLI)")
+	flag.BoolVar(&useQwenCommits, "qwen-commits", false, "Use Qwen AI for commit messages (via qwen CLI)")
 
 	flag.Usage = showHelp
 }
@@ -49,6 +52,8 @@ func showHelp() {
 	fmt.Println("                          (requires gemini CLI installed)")
 	fmt.Println("  -claude, --claude-commits  Use Claude AI for commit messages")
 	fmt.Println("                          (requires claude CLI installed)")
+	fmt.Println("  -qwen, --qwen-commits   Use Qwen AI for commit messages")
+	fmt.Println("                          (requires qwen CLI installed)")
 	fmt.Println("                          Falls back to timestamp on error")
 	fmt.Println("\nEXAMPLES:")
 	fmt.Println("  git-air                 # Run with default 30 second interval")
@@ -57,6 +62,7 @@ func showHelp() {
 	fmt.Println("  git-air --interval 10   # Check every 10 minutes")
 	fmt.Println("  git-air -ai             # Use Gemini AI commit messages")
 	fmt.Println("  git-air -claude         # Use Claude AI commit messages")
+	fmt.Println("  git-air -qwen           # Use Qwen AI commit messages")
 	fmt.Println("  git-air -i 2 -claude    # 2 min interval with Claude AI")
 	fmt.Println("\nDESCRIPTION:")
 	fmt.Println("  Automatically discovers and synchronizes all Git repositories")
@@ -102,11 +108,15 @@ func main() {
 	} else {
 		fmt.Println("🔧 Monorepo mode: AUTO-DETECT")
 	}
-	// Handle AI flags - Claude takes precedence if both specified
+	// Handle AI flags - Precedence: Claude > Qwen > Gemini
 	aiProvider := ""
 	if useClaudeCommits {
 		aiProvider = "Claude"
-		useAICommits = false // Claude overrides gemini
+		useQwenCommits = false
+		useAICommits = false
+	} else if useQwenCommits {
+		aiProvider = "Qwen"
+		useAICommits = false
 	} else if useAICommits {
 		aiProvider = "Gemini"
 	}
@@ -157,7 +167,7 @@ func main() {
 		// Auto commit and push changes
 		changesFound := false
 		for _, repo := range repos {
-			if processRepo(repo, forceMonorepo, useAICommits, useClaudeCommits) {
+			if processRepo(repo, forceMonorepo, useAICommits, useClaudeCommits, useQwenCommits) {
 				changesFound = true
 			}
 		}
@@ -205,6 +215,76 @@ func findGitRepos(root string) ([]string, error) {
 	})
 	
 	return repos, err
+}
+
+// generateQwenCommitMessage calls qwen CLI to generate commit message
+func generateQwenCommitMessage(gitDiff string) (string, error) {
+	// Create context with timeout (25 seconds)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	// Limit diff size to avoid overwhelming Qwen (max 2000 chars)
+	if len(gitDiff) > 2000 {
+		gitDiff = gitDiff[:2000] + "\n... (truncated)"
+	}
+
+	// Build a clear prompt with the actual changes
+	prompt := fmt.Sprintf(`You are a git commit message generator. Based on the following git diff output, generate ONE concise commit message.
+
+Rules:
+- ONE line only
+- Max 50 characters
+- Use imperative mood (e.g., "Add feature" not "Added feature")
+- Be specific about what changed
+- No explanations, just the commit message
+
+Git diff:
+---
+%s
+---
+
+Commit message:`, gitDiff)
+
+	cmd := exec.CommandContext(ctx, "qwen", "-p", prompt)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		// Context timeout or qwen error
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("qwen timeout after 25s")
+		}
+		// Check for auth error
+		stderrStr := stderr.String()
+		if strings.Contains(stderrStr, "Auth method") || strings.Contains(stderrStr, "API") {
+			return "", fmt.Errorf("qwen not configured (no API key)")
+		}
+		return "", fmt.Errorf("qwen error: %v", err)
+	}
+
+	output := stdout.String()
+
+	// Parse output - Qwen returns clean output
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			// Clean up the message
+			line = strings.TrimPrefix(line, "feat: ")
+			line = strings.TrimPrefix(line, "fix: ")
+			line = strings.TrimPrefix(line, "chore: ")
+			// Keep it simple
+			if len(line) > 72 {
+				line = line[:72]
+			}
+			return line, nil
+		}
+	}
+
+	return "", fmt.Errorf("no valid response from qwen")
 }
 
 // generateClaudeCommitMessage calls claude CLI to generate commit message
@@ -339,7 +419,7 @@ Commit message:`, gitDiff)
 }
 
 // processRepo handles one git repository, returns true if changes were committed
-func processRepo(repoPath string, forceMonorepo bool, useGemini bool, useClaude bool) bool {
+func processRepo(repoPath string, forceMonorepo bool, useGemini bool, useClaude bool, useQwen bool) bool {
 	// Change to repo directory
 	oldDir, err := os.Getwd()
 	if err != nil {
@@ -386,9 +466,11 @@ func processRepo(repoPath string, forceMonorepo bool, useGemini bool, useClaude 
 	var commitMsg string
 	aiProvider := ""
 
-	// Determine which AI to use (Claude takes precedence)
+	// Determine which AI to use (Precedence: Claude > Qwen > Gemini)
 	if useClaude {
 		aiProvider = "Claude"
+	} else if useQwen {
+		aiProvider = "Qwen"
 	} else if useGemini {
 		aiProvider = "Gemini"
 	}
@@ -408,6 +490,8 @@ func processRepo(repoPath string, forceMonorepo bool, useGemini bool, useClaude 
 			// Call the appropriate AI
 			if aiProvider == "Claude" {
 				aiMsg, aiErr = generateClaudeCommitMessage(string(diffOutput))
+			} else if aiProvider == "Qwen" {
+				aiMsg, aiErr = generateQwenCommitMessage(string(diffOutput))
 			} else {
 				aiMsg, aiErr = generateAICommitMessage(string(diffOutput))
 			}

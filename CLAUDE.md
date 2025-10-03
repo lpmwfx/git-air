@@ -42,7 +42,8 @@ cd ~ && ./git-air -i 2
 - `-h`, `--help`: Show help screen and exit
 - `-i`, `--interval <minutes>`: Set check interval (0.5-30 minutes, default: 0.5)
 - `-mr`, `--monorepo`: Force monorepo mode (auto-detects by default)
-- `-ai`, `--ai-commits`: Use AI-generated commit messages via gemini CLI (requires gemini CLI installed)
+- `-ai`, `--ai-commits`: Use Gemini AI for commit messages (requires gemini CLI installed)
+- `-claude`, `--claude-commits`: Use Claude AI for commit messages (requires claude CLI installed, takes precedence over -ai)
 
 ## Architecture
 
@@ -59,6 +60,7 @@ The entire application is in `main.go` (~285 lines). This is intentional - the p
 ### Key Functions
 - `processRepo()`: Main processing logic - handles monorepo sync, auto-commit (with optional AI), multi-remote push
 - `generateAICommitMessage()`: Calls gemini CLI with git diff, 30s timeout, returns AI-generated message
+- `generateClaudeCommitMessage()`: Calls claude CLI with git diff, 20s timeout, returns Claude-generated message
 - `isMonorepo()`: Detects if repo has submodules or nested repos
 - `syncSubmodules()`: Updates submodules before main repo commit
 - `pushToAllRemotes()`: Pushes to every configured remote (origin, backup, mirror, etc.)
@@ -98,11 +100,12 @@ Uses only Go standard library (`os`, `exec`, `path/filepath`, `time`). Module de
 - Monorepo: `"auto commit (monorepo) - {timestamp}"`
 - Format: `2006-01-02 15:04:05`
 
-**AI Mode (-ai flag):**
-- Uses gemini CLI to generate descriptive commit messages
+**AI Mode (-ai or -claude flag):**
+- **Gemini** (`-ai`): Uses gemini CLI, 30-second timeout
+- **Claude** (`-claude`): Uses claude CLI, 20-second timeout (faster)
 - Analyzes git diff and creates concise, imperative mood messages
-- 30-second timeout per request
 - Automatically falls back to timestamp commits on error
+- If both flags specified, Claude takes precedence
 - Example: `"Add command-line flag parsing"` or `"Refactor error handling logic"`
 
 ### Directory Exclusions
