@@ -194,15 +194,33 @@ func findGitRepos(root string) ([]string, error) {
 
 // generateAICommitMessage calls gemini CLI to generate commit message
 func generateAICommitMessage(gitDiff string) (string, error) {
-	// Create context with timeout (20 seconds for gemini to respond)
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// Create context with timeout (30 seconds for gemini to respond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	prompt := "Generate a concise git commit message (one line, max 50 chars, imperative mood):"
-	input := fmt.Sprintf("Git changes:\n%s", gitDiff)
+	// Limit diff size to avoid overwhelming gemini (max 2000 chars)
+	if len(gitDiff) > 2000 {
+		gitDiff = gitDiff[:2000] + "\n... (truncated)"
+	}
 
-	cmd := exec.CommandContext(ctx, "gemini", "-p", prompt)
-	cmd.Stdin = strings.NewReader(input)
+	// Build a clear prompt with the actual changes inline
+	input := fmt.Sprintf(`You are a git commit message generator. Based on the following git diff output, generate ONE concise commit message.
+
+Rules:
+- ONE line only
+- Max 50 characters
+- Use imperative mood (e.g., "Add feature" not "Added feature")
+- Be specific about what changed
+- No explanations, just the commit message
+
+Git diff:
+---
+%s
+---
+
+Commit message:`, gitDiff)
+
+	cmd := exec.CommandContext(ctx, "gemini", input)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -212,7 +230,7 @@ func generateAICommitMessage(gitDiff string) (string, error) {
 	if err != nil {
 		// Context timeout or gemini error
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("gemini timeout after 20s")
+			return "", fmt.Errorf("gemini timeout after 30s")
 		}
 		return "", fmt.Errorf("gemini error: %v", err)
 	}
