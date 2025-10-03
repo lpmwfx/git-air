@@ -15,9 +15,10 @@ import (
 )
 
 var (
-	forceMonorepo bool
-	intervalMins  string
-	useAICommits  bool
+	forceMonorepo   bool
+	intervalMins    string
+	useAICommits    bool
+	useClaudeCommits bool
 )
 
 func init() {
@@ -27,6 +28,8 @@ func init() {
 	flag.StringVar(&intervalMins, "interval", "0.5", "Check interval in minutes (0.5-30)")
 	flag.BoolVar(&useAICommits, "ai", false, "Use AI-generated commit messages via gemini CLI")
 	flag.BoolVar(&useAICommits, "ai-commits", false, "Use AI-generated commit messages via gemini CLI")
+	flag.BoolVar(&useClaudeCommits, "claude", false, "Use Claude AI for commit messages (via claude CLI)")
+	flag.BoolVar(&useClaudeCommits, "claude-commits", false, "Use Claude AI for commit messages (via claude CLI)")
 
 	flag.Usage = showHelp
 }
@@ -42,16 +45,19 @@ func showHelp() {
 	fmt.Println("                          Default: 0.5 (30 seconds)")
 	fmt.Println("  -mr, --monorepo         Force monorepo mode")
 	fmt.Println("                          (auto-detects if not set)")
-	fmt.Println("  -ai, --ai-commits       Use AI-generated commit messages")
+	fmt.Println("  -ai, --ai-commits       Use Gemini AI for commit messages")
 	fmt.Println("                          (requires gemini CLI installed)")
+	fmt.Println("  -claude, --claude-commits  Use Claude AI for commit messages")
+	fmt.Println("                          (requires claude CLI installed)")
 	fmt.Println("                          Falls back to timestamp on error")
 	fmt.Println("\nEXAMPLES:")
 	fmt.Println("  git-air                 # Run with default 30 second interval")
 	fmt.Println("  git-air -i 1            # Check every 1 minute")
 	fmt.Println("  git-air -i 5 -mr        # Check every 5 minutes, force monorepo")
 	fmt.Println("  git-air --interval 10   # Check every 10 minutes")
-	fmt.Println("  git-air -ai             # Use AI-generated commit messages")
-	fmt.Println("  git-air -i 2 -ai        # 2 min interval with AI commits")
+	fmt.Println("  git-air -ai             # Use Gemini AI commit messages")
+	fmt.Println("  git-air -claude         # Use Claude AI commit messages")
+	fmt.Println("  git-air -i 2 -claude    # 2 min interval with Claude AI")
 	fmt.Println("\nDESCRIPTION:")
 	fmt.Println("  Automatically discovers and synchronizes all Git repositories")
 	fmt.Println("  in the current directory and subdirectories.")
@@ -96,8 +102,17 @@ func main() {
 	} else {
 		fmt.Println("🔧 Monorepo mode: AUTO-DETECT")
 	}
-	if useAICommits {
-		fmt.Println("🤖 AI Commits: ENABLED (via gemini CLI)")
+	// Handle AI flags - Claude takes precedence if both specified
+	aiProvider := ""
+	if useClaudeCommits {
+		aiProvider = "Claude"
+		useAICommits = false // Claude overrides gemini
+	} else if useAICommits {
+		aiProvider = "Gemini"
+	}
+
+	if aiProvider != "" {
+		fmt.Printf("🤖 AI Commits: ENABLED (via %s CLI)\n", aiProvider)
 	} else {
 		fmt.Println("🤖 AI Commits: DISABLED (using timestamp)")
 	}
@@ -142,7 +157,7 @@ func main() {
 		// Auto commit and push changes
 		changesFound := false
 		for _, repo := range repos {
-			if processRepo(repo, forceMonorepo, useAICommits) {
+			if processRepo(repo, forceMonorepo, useAICommits, useClaudeCommits) {
 				changesFound = true
 			}
 		}
@@ -190,6 +205,71 @@ func findGitRepos(root string) ([]string, error) {
 	})
 	
 	return repos, err
+}
+
+// generateClaudeCommitMessage calls claude CLI to generate commit message
+func generateClaudeCommitMessage(gitDiff string) (string, error) {
+	// Create context with timeout (20 seconds - Claude is faster than Gemini)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	// Limit diff size to avoid overwhelming Claude (max 2000 chars)
+	if len(gitDiff) > 2000 {
+		gitDiff = gitDiff[:2000] + "\n... (truncated)"
+	}
+
+	// Build a clear prompt with the actual changes
+	prompt := fmt.Sprintf(`You are a git commit message generator. Based on the following git diff output, generate ONE concise commit message.
+
+Rules:
+- ONE line only
+- Max 50 characters
+- Use imperative mood (e.g., "Add feature" not "Added feature")
+- Be specific about what changed
+- No explanations, just the commit message
+
+Git diff:
+---
+%s
+---
+
+Commit message:`, gitDiff)
+
+	cmd := exec.CommandContext(ctx, "claude", "-p", prompt)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		// Context timeout or claude error
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("claude timeout after 20s")
+		}
+		return "", fmt.Errorf("claude error: %v", err)
+	}
+
+	output := stdout.String()
+
+	// Parse output - Claude returns clean output
+	lines := strings.Split(output, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			// Clean up the message
+			line = strings.TrimPrefix(line, "feat: ")
+			line = strings.TrimPrefix(line, "fix: ")
+			line = strings.TrimPrefix(line, "chore: ")
+			// Keep it simple
+			if len(line) > 72 {
+				line = line[:72]
+			}
+			return line, nil
+		}
+	}
+
+	return "", fmt.Errorf("no valid response from claude")
 }
 
 // generateAICommitMessage calls gemini CLI to generate commit message
@@ -259,7 +339,7 @@ Commit message:`, gitDiff)
 }
 
 // processRepo handles one git repository, returns true if changes were committed
-func processRepo(repoPath string, forceMonorepo bool, useAI bool) bool {
+func processRepo(repoPath string, forceMonorepo bool, useGemini bool, useClaude bool) bool {
 	// Change to repo directory
 	oldDir, err := os.Getwd()
 	if err != nil {
@@ -304,21 +384,38 @@ func processRepo(repoPath string, forceMonorepo bool, useAI bool) bool {
 
 	timestamp := time.Now().Format("2006-01-02 15:04:05")
 	var commitMsg string
+	aiProvider := ""
+
+	// Determine which AI to use (Claude takes precedence)
+	if useClaude {
+		aiProvider = "Claude"
+	} else if useGemini {
+		aiProvider = "Gemini"
+	}
 
 	// Try AI-generated commit message if enabled
-	if useAI {
-		fmt.Printf("  🤖 Generating AI commit message...")
+	if aiProvider != "" {
+		fmt.Printf("  🤖 Generating %s commit message...", aiProvider)
 
 		// Get git diff to send to AI
 		diffCmd := exec.Command("git", "diff", "--staged")
 		diffOutput, diffErr := diffCmd.Output()
 
 		if diffErr == nil && len(diffOutput) > 0 {
-			aiMsg, aiErr := generateAICommitMessage(string(diffOutput))
+			var aiMsg string
+			var aiErr error
+
+			// Call the appropriate AI
+			if aiProvider == "Claude" {
+				aiMsg, aiErr = generateClaudeCommitMessage(string(diffOutput))
+			} else {
+				aiMsg, aiErr = generateAICommitMessage(string(diffOutput))
+			}
+
 			if aiErr == nil && aiMsg != "" {
 				commitMsg = aiMsg
 				fmt.Printf(" ✓\n")
-				fmt.Printf("  💬 AI message: \"%s\"\n", commitMsg)
+				fmt.Printf("  💬 %s message: \"%s\"\n", aiProvider, commitMsg)
 			} else {
 				// Fallback to timestamp
 				fmt.Printf(" ❌ (%v)\n", aiErr)
@@ -349,10 +446,10 @@ func processRepo(repoPath string, forceMonorepo bool, useAI bool) bool {
 		return false
 	}
 
-	if !useAI {
+	if aiProvider == "" {
 		fmt.Printf("  ✓ Committed changes in %s\n", repoName)
 	} else {
-		fmt.Printf("  ✓ Committed with AI message\n")
+		fmt.Printf("  ✓ Committed with %s AI message\n", aiProvider)
 	}
 
 	// Push to all remotes immediately

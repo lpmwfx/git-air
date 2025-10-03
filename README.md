@@ -5,11 +5,13 @@ A simple, fully automatic Git daemon service for Linux and macOS that handles au
 ## Features
 
 - **🔍 Auto Discovery**: Automatically finds all Git repositories in current directory and subdirectories
-- **📝 Auto Commit**: Automatically commits all changes with timestamp
-- **🚀 Multi-Remote Push**: Pushes to ALL configured remotes for each repository  
+- **📝 Auto Commit**: Automatically commits all changes with timestamp or AI-generated messages
+- **🤖 AI Commit Messages**: Optional AI-generated commit messages via gemini CLI (with fallback)
+- **🚀 Multi-Remote Push**: Pushes to ALL configured remotes for each repository
 - **📡 Inter-Project Communication**: Pulls updates from remotes every minute
 - **📚 Monorepo Support**: Syncs submodules before committing main repository
 - **🏠 Dev Server Ready**: Perfect for development servers with multiple projects
+- **⏱️ Configurable Interval**: Set check interval from 30 seconds to 30 minutes
 
 ## Quick Start
 
@@ -32,6 +34,15 @@ cp /path/to/git-air ./
 - 📝 Auto-commit changes every 30 seconds if detected
 - 🚀 Push to all configured remotes immediately
 - 📡 Pull updates from remotes every minute
+
+**With AI commit messages:**
+```bash
+# Use AI to generate descriptive commit messages (requires gemini CLI)
+./git-air -ai
+
+# Combine with custom interval
+./git-air -i 2 -ai  # Check every 2 minutes with AI commits
+```
 
 ### 2. Running Git Air as Ubuntu Service (Dev Server)
 
@@ -101,6 +112,7 @@ journalctl -u git-air -f
 ### Prerequisites
 - Go 1.21 or higher
 - Git installed and configured
+- (Optional) [Gemini CLI](https://github.com/google/generative-ai-go) for AI-generated commit messages
 
 ### Build from Source
 ```bash
